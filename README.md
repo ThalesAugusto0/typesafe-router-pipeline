@@ -50,7 +50,7 @@ If the TypeSafe API is unreachable, times out, rate-limits, or errors in any way
 Each of the four model valves (`CHEAP_MODEL`, `EXPENSIVE_MODEL`, `CODE_CHEAP_MODEL`, `CODE_EXPENSIVE_MODEL`) holds a comma-separated, ordered list of `provider:model` entries, e.g.:
 
 ```
-openrouter:deepseek/deepseek-v4-flash-0731:free, orcarouter:deepseek/deepseek-v4-flash-free
+orcarouter:deepseek/deepseek-v4-flash-free, openrouter:google/gemma-4-31b-it:free, openrouter:openrouter/free
 ```
 
 The pipeline tries each entry in order against the matching provider's OpenAI-compatible `/chat/completions` endpoint. On any failure (HTTP error, timeout, connection error) it logs the error and moves to the next entry. If every entry fails, the pipeline returns a single error string listing all the failures instead of raising.

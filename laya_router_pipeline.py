@@ -100,14 +100,14 @@ class Pipeline:
         # provider is "openrouter" or "orcarouter". The first entry is tried first; on any
         # failure (429, 5xx, timeout...) the next entry is tried. Providers can be mixed freely.
         CHEAP_MODEL: str = (
-            "openrouter:deepseek/deepseek-v4-flash-0731:free, "
-            "orcarouter:deepseek/deepseek-v4-flash-free"
+            "orcarouter:deepseek/deepseek-v4-flash-free, openrouter:google/gemma-4-31b-it:free, "
+            "orcarouter:z-ai/glm-5.3-flash-free, openrouter:openrouter/free"
         )
         EXPENSIVE_MODEL: str = "openrouter:z-ai/glm-5.3, openrouter:deepseek/deepseek-v4-pro"
         # Used when the prompt is classified as code.
         CODE_CHEAP_MODEL: str = (
-            "openrouter:deepseek/deepseek-v4-flash-0731:free, "
-            "orcarouter:deepseek/deepseek-v4-flash-free"
+            "orcarouter:deepseek/deepseek-v4-flash-free, openrouter:poolside/laguna-s-2.1:free, "
+            "orcarouter:z-ai/glm-5.3-flash-free, openrouter:openrouter/free"
         )
         CODE_EXPENSIVE_MODEL: str = "openrouter:moonshotai/kimi-k3, openrouter:deepseek/deepseek-v4-pro"
         BACKEND_TIMEOUT_SECONDS: float = 120.0
