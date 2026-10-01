@@ -57,13 +57,23 @@ Classification **never raises**. A missing `laya` package, a checkpoint that wil
 
 `LAYA_MODE` picks where the model lives:
 
-- **`local`** (default) — the checkpoint is loaded in-process on the Pipelines server and reused for every request. The `requirements: laya` frontmatter makes the Pipelines server install `laya`, which pulls `torch` and `transformers` with it. The first build costs ~7–10 s on CPU plus a few hundred MB of download on a cold Hub cache; `LAYA_PRELOAD` (default on) pays that during `on_startup`, off the event loop, instead of on the first chat message. Loading is guarded by a lock, so concurrent requests build it once.
-- **`server`** — the pipeline instead POSTs to a [`laya-serve`](https://github.com/NandhaKishorM/laya) sidecar at `{LAYA_BASE_URL}/v1/systemone`. This keeps `torch` out of the Pipelines container and lets several pipelines share one warm model. If you run this way, drop the `requirements: laya` line from the file's frontmatter so the heavy install is skipped.
+- **`server`** (default) — the pipeline POSTs to a [`laya-serve`](https://github.com/NandhaKishorM/laya) sidecar at `{LAYA_BASE_URL}/v1/systemone`. This keeps `torch` out of the Pipelines container and lets several pipelines (or an MCP server) share one warm model. A Compose service built from Laya's own Dockerfile:
 
-  ```bash
-  pip install "laya[serve]"
-  LAYA_DEVICE=cpu LAYA_PRELOAD=1 laya-serve   # listens on 0.0.0.0:8000
+  ```yaml
+  laya:
+    build: https://github.com/NandhaKishorM/laya.git#6d942c92081fbc139e736bbd9ac0023223c29b7f  # v0.3.22
+    command: ["laya-serve"]
+    environment:
+      - LAYA_DEVICE=cpu
+      - LAYA_MODELS=english,multilingual   # the two auto-routing picks; skips typed-decisions
+      - LAYA_THREADS=4
+      - LAYA_API_KEY=${LAYA_API_KEY}
+    volumes:
+      - laya-cache:/home/laya/.cache/huggingface
   ```
+
+  Then set `LAYA_BASE_URL=http://laya:8000` and the same `LAYA_API_KEY` on the pipeline.
+- **`local`** — the checkpoint is loaded in-process on the Pipelines server and reused for every request. Needs `pip install laya` in the Pipelines container (it pulls `torch` and `transformers`); it is deliberately not in the frontmatter `requirements`, which the Pipelines server would reinstall on every boot. The first build costs ~7–10 s on CPU plus a few hundred MB of download on a cold Hub cache; `LAYA_PRELOAD` (default on) builds the `english` and `multilingual` checkpoints during `on_startup`, off the event loop, instead of on the first chat message. Loading is guarded by a lock, so concurrent requests build it once.
 
 `LAYA_CHECKPOINT` empty (the default) uses Laya's `Router`, which picks a checkpoint per request from the detected language. Set it to `english`, `multilingual`, `typed-decisions`, or any `repo/id` (optionally `repo/id#subfolder`) to pin one.
 
@@ -72,7 +82,7 @@ Classification **never raises**. A missing `laya` package, a checkpoint that wil
 Identical to the TypeSafe variant. Each of the four model valves (`CHEAP_MODEL`, `EXPENSIVE_MODEL`, `CODE_CHEAP_MODEL`, `CODE_EXPENSIVE_MODEL`) holds a comma-separated, ordered list of `provider:model` entries, e.g.:
 
 ```
-openrouter:deepseek/deepseek-v4-flash-0731:free, orcarouter:deepseek/deepseek-v4-flash-free
+orcarouter:deepseek/deepseek-v4-flash-free, openrouter:google/gemma-4-31b-it:free, openrouter:openrouter/free
 ```
 
 The pipeline tries each entry in order against the matching provider's OpenAI-compatible `/chat/completions` endpoint. On any failure (HTTP error, timeout, connection error) it logs the error and moves to the next entry. If every entry fails, the pipeline returns a single error string listing all the failures instead of raising.
@@ -94,12 +104,12 @@ All settings are exposed as Pipelines **Valves** and can also be seeded from env
 
 | Valve | Env var | Purpose |
 |---|---|---|
-| `LAYA_MODE` | `LAYA_MODE` | `local` (in-process) or `server` (`laya-serve` over HTTP) |
+| `LAYA_MODE` | `LAYA_MODE` | `server` (`laya-serve` over HTTP, default) or `local` (in-process) |
 | `LAYA_CHECKPOINT` | `LAYA_CHECKPOINT` | Pin a checkpoint (`english`, `multilingual`, `typed-decisions`, `repo/id[#subfolder]`); empty = auto-route per language |
 | `LAYA_DEVICE` | `LAYA_DEVICE` | `cpu` (default) or `cuda` |
 | `LAYA_NUM_THREADS` | — | `torch.set_num_threads()` for the classifier; `0` leaves torch's default |
 | `LAYA_PRELOAD` | — | Build the checkpoint during startup instead of on the first message |
-| `LAYA_MAX_LOADED` | — | How many checkpoints the `Router` may keep resident (default `1`) |
+| `LAYA_MAX_LOADED` | — | How many checkpoints the `Router` may keep resident (default `2`: auto-routing switches between `english` and `multilingual`, so `1` rebuilds one per language switch) |
 | `LAYA_LANG` | — | Force a language hint (`pt`, `de`, …) instead of auto-detection |
 | `LAYA_MAX_LEN` | — | Truncate classifier input; `0` = the checkpoint's own context length |
 | `LAYA_BASE_URL` / `LAYA_API_KEY` | same | `laya-serve` location and auth (`server` mode only) |
@@ -120,15 +130,24 @@ All settings are exposed as Pipelines **Valves** and can also be seeded from env
 - At least one of an OpenRouter or OrcaRouter API key for the actual backend completions.
 - **No key of any kind for the routing** — Laya is Apache-2.0 and runs locally.
 
-Python dependency: `laya` (declared in the pipeline's `requirements` frontmatter, installed automatically by the Pipelines server). It brings `torch` 2.14+, `transformers` 5.x and `huggingface_hub` 1.x along, so budget ~2 GB of image/disk and a few hundred MB for the checkpoint. In `server` mode none of that is needed in the Pipelines container.
+Python dependencies: only `requests` and `pydantic` in `server` mode. `local` mode also needs `laya`, which brings `torch` 2.14+, `transformers` 5.x and `huggingface_hub` 1.x along, so budget ~2 GB of image/disk and a few hundred MB per checkpoint.
 
 ## Installation
 
 1. Copy `laya_router_pipeline.py` into your Open WebUI Pipelines server (via the Admin UI's "Upload Pipeline" or by mounting it in the `pipelines` directory).
-2. Set the backend valves/environment variables listed above. The Laya defaults (local, CPU, auto-routed checkpoint, preload on) need no configuration.
+2. Run `laya-serve` (see [Two deployment modes](#2-two-deployment-modes)) and set `LAYA_BASE_URL` / `LAYA_API_KEY` plus the backend valves listed above.
 3. Select "Laya Router" as a model in Open WebUI — every message sent to it is classified and routed automatically.
 
-The first startup downloads the checkpoint from the Hugging Face Hub; watch the Pipelines log for `[LayaRouter] loaded Laya Router on cpu`. Classifications are logged as `[LayaRouter] classified prompt as 'expensive'/'code' (laya: english)`.
+The first `laya-serve` startup downloads the checkpoints from the Hugging Face Hub; `/health` answers once they are built. Classifications are logged as `[LayaRouter] classified prompt as 'expensive'/'code' (laya: english)`.
+
+## Tests
+
+```bash
+pip install requests pydantic
+python test_laya_router_pipeline.py
+```
+
+Runs in `server` mode with `requests.post` stubbed, so neither Laya nor the network is needed.
 
 ## License
 

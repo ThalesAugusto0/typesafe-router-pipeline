@@ -5,7 +5,6 @@ date: 2026-10-01
 version: 0.1.0
 license: MIT
 description: Routes each prompt to a cheap or an expensive backend LLM based on a Laya (System 1 decision engine) classification of the prompt's complexity. Laya is open source and runs locally on the CPU.
-requirements: laya
 environment_variables: LAYA_MODE, LAYA_CHECKPOINT, LAYA_DEVICE, LAYA_BASE_URL, LAYA_API_KEY, OPENROUTER_API_KEY, OPENROUTER_BASE_URL, ORCAROUTER_API_KEY, ORCAROUTER_BASE_URL, CHEAP_PROVIDER, CHEAP_MODEL, EXPENSIVE_PROVIDER, EXPENSIVE_MODEL
 """
 
@@ -36,10 +35,11 @@ CHECKPOINTS = {
 class Pipeline:
     class Valves(BaseModel):
         # Laya (classification) settings.
-        # "local" runs the model in-process on this server (needs the `laya` package,
-        # which pulls torch + transformers). "server" talks to a `laya-serve` sidecar
-        # over HTTP, which keeps torch out of the Pipelines container.
-        LAYA_MODE: str = "local"
+        # "server" (default) talks to a `laya-serve` sidecar over HTTP, which keeps torch
+        # out of the Pipelines container. "local" runs the model in-process and needs
+        # `pip install laya` (torch + transformers) in the Pipelines container first; it
+        # is not in the frontmatter `requirements`, which would install it on every boot.
+        LAYA_MODE: str = "server"
         # Empty means Laya's Router picks the checkpoint per request from the detected
         # script/language. Otherwise one of CHECKPOINTS above, or any "repo/id" (with an
         # optional "repo/id#subfolder") to pin a single checkpoint.
@@ -51,8 +51,10 @@ class Pipeline:
         # Build the checkpoint during on_startup instead of on the first chat message.
         # The first build costs ~7-10s on CPU, plus the download on a cold cache.
         LAYA_PRELOAD: bool = True
-        # How many checkpoints the Router may keep resident; 1 is the memory-safe choice.
-        LAYA_MAX_LOADED: int = 1
+        # How many checkpoints the Router may keep resident. Auto-routing switches between
+        # english and multilingual, so 1 rebuilds a checkpoint (seconds) on every language
+        # switch; 2 keeps both warm. Use 1 only together with a pinned LAYA_CHECKPOINT.
+        LAYA_MAX_LOADED: int = 2
         # Force a language hint instead of letting Laya detect it ("pt", "de", ...).
         LAYA_LANG: str = ""
         # Truncate the classifier input; 0 uses the checkpoint's own context length.
@@ -98,14 +100,14 @@ class Pipeline:
         # provider is "openrouter" or "orcarouter". The first entry is tried first; on any
         # failure (429, 5xx, timeout...) the next entry is tried. Providers can be mixed freely.
         CHEAP_MODEL: str = (
-            "openrouter:deepseek/deepseek-v4-flash-0731:free, "
-            "orcarouter:deepseek/deepseek-v4-flash-free"
+            "orcarouter:deepseek/deepseek-v4-flash-free, openrouter:google/gemma-4-31b-it:free, "
+            "orcarouter:z-ai/glm-5.3-flash-free, openrouter:openrouter/free"
         )
         EXPENSIVE_MODEL: str = "openrouter:z-ai/glm-5.3, openrouter:deepseek/deepseek-v4-pro"
         # Used when the prompt is classified as code.
         CODE_CHEAP_MODEL: str = (
-            "openrouter:deepseek/deepseek-v4-flash-0731:free, "
-            "orcarouter:deepseek/deepseek-v4-flash-free"
+            "orcarouter:deepseek/deepseek-v4-flash-free, openrouter:poolside/laguna-s-2.1:free, "
+            "orcarouter:z-ai/glm-5.3-flash-free, openrouter:openrouter/free"
         )
         CODE_EXPENSIVE_MODEL: str = "openrouter:moonshotai/kimi-k3, openrouter:deepseek/deepseek-v4-pro"
         BACKEND_TIMEOUT_SECONDS: float = 120.0
@@ -120,10 +122,12 @@ class Pipeline:
     def __init__(self):
         # self.id left unset on purpose, see other examples in this repo.
         self.name = "Laya Router"
+        # ponytail: single slot, shared across chats; upgrade to a dict keyed by chat_id if concurrent tool rounds mix
+        self._route = ("", "", "")
 
         self.valves = self.Valves(
             **{
-                "LAYA_MODE": os.getenv("LAYA_MODE", "local"),
+                "LAYA_MODE": os.getenv("LAYA_MODE", "server"),
                 "LAYA_CHECKPOINT": os.getenv("LAYA_CHECKPOINT", ""),
                 "LAYA_DEVICE": os.getenv("LAYA_DEVICE", "cpu"),
                 "LAYA_BASE_URL": os.getenv("LAYA_BASE_URL", "http://localhost:8000"),
@@ -238,10 +242,13 @@ class Pipeline:
                 # Router auto-detects the script/language and loads the matching
                 # checkpoint, which is what makes non-English prompts route well.
                 agent = laya.Router(
-                    preload=v.LAYA_PRELOAD,
                     device=v.LAYA_DEVICE,
                     max_loaded=max(v.LAYA_MAX_LOADED, 1),
                 )
+                if v.LAYA_PRELOAD:
+                    # Not Router(preload=True): that builds all three checkpoints (~1.16B
+                    # params) and lifts max_loaded to 3. Auto-routing only picks these two.
+                    agent.preload(["english", "multilingual"][: agent.max_loaded])
                 print(f"[LayaRouter] loaded Laya Router on {v.LAYA_DEVICE}")
             else:
                 repo, subfolder = CHECKPOINTS.get(spec, (None, None))
@@ -382,19 +389,41 @@ class Pipeline:
 
     @staticmethod
     def _stream_with_footer(lines: Iterator, footer: str) -> Iterator:
-        """Pass the SSE stream through, injecting the footer as a last content chunk."""
+        """Pass the SSE data chunks through, injecting the footer as a last content chunk.
+
+        The Pipelines server wraps any line not starting with "data:" as reply text, so
+        SSE comments/keep-alives (": OPENROUTER PROCESSING") and blank lines are dropped.
+        A round that ends in tool calls gets no footer: Open WebUI runs the tools and
+        calls us again, and only the final round should carry it.
+        """
+        has_tool_calls = False
         for line in lines:
             text = line.decode() if isinstance(line, bytes) else line
-            if footer and text.strip() == "data: [DONE]":
-                chunk = {"choices": [{"index": 0, "delta": {
-                    "content": footer}, "finish_reason": None}]}
-                yield "data: " + json.dumps(chunk)
+            if not text.startswith("data:"):
+                continue
+            if text.strip() == "data: [DONE]":
+                if footer and not has_tool_calls:
+                    chunk = {"choices": [{"index": 0, "delta": {"content": footer}, "finish_reason": None}]}
+                    yield "data: " + json.dumps(chunk)
+            elif not has_tool_calls and '"tool_calls"' in text:
+                try:
+                    choices = json.loads(text[5:]).get("choices") or [{}]
+                    has_tool_calls = bool((choices[0].get("delta") or {}).get("tool_calls"))
+                except ValueError:
+                    pass
             yield line
 
     def pipe(
         self, user_message: str, model_id: str, messages: List[dict], body: dict
     ) -> Union[str, Generator, Iterator]:
-        tier, kind = self.classify(messages, user_message)
+        # A tool round (web search, ...) re-calls us with the same user message; keep its
+        # route instead of re-classifying, so one answer doesn't hop between models.
+        body_messages = body.get("messages", [])
+        if body_messages and body_messages[-1].get("role") == "tool" and self._route[0] == user_message:
+            tier, kind = self._route[1:]
+        else:
+            tier, kind = self.classify(messages, user_message)
+            self._route = (user_message, tier, kind)
         v = self.valves
         if tier == "expensive":
             spec = v.CODE_EXPENSIVE_MODEL if kind == "code" else v.EXPENSIVE_MODEL
