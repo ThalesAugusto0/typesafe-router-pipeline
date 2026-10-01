@@ -1,3 +1,4 @@
 typesafe-sdk
 requests
 pydantic
+laya

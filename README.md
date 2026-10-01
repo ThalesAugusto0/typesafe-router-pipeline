@@ -1,5 +1,10 @@
 # TypeSafe Router Pipeline
 
+> Two pipelines live in this repo, same router, different classifier:
+> **`typesafe_router_pipeline.py`** (below) classifies with the hosted TypeSafe AI API, and
+> **`laya_router_pipeline.py`** ([docs](./README-laya.md)) classifies with [Laya](https://github.com/NandhaKishorM/laya),
+> an Apache-2.0 System 1 decision engine that runs locally on the CPU with no API key.
+
 An [Open WebUI Pipelines](https://github.com/open-webui/pipelines) function that routes every incoming chat message to a **cheap** or an **expensive** backend LLM, picked automatically by classifying the prompt with [TypeSafe AI](https://typesafe.ai)'s `system_one` primitive.
 
 Instead of hard-coding "always use GPT-4" or "always use the free model", this pipeline asks a fast classifier two questions about the request and routes accordingly:
